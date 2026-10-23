@@ -16,7 +16,7 @@ export default defineConfig(({ mode }) => {
         .replace('<title>Our House 🏠</title>', '<title>Our House Demo 🏠</title>'),
       closeBundle() {
         const out = (f) => fileURLToPath(new URL(`./dist/${f}`, import.meta.url))
-        const sw = readFileSync(out('sw.js'), 'utf8').replace(/const C = '[^']+'/, "const C = 'ourhouse-demo-v1'")
+        const sw = readFileSync(out('sw.js'), 'utf8').replace(/const C = '([^']+)'/, (m, c) => `const C = 'ourhouse-demo-${c.replace('huis-', '')}'`)
         writeFileSync(out('sw.js'), sw)
         const m = JSON.parse(readFileSync(out('manifest.webmanifest'), 'utf8'))
         Object.assign(m, { name: 'Our House Demo – traffic lights & chores', short_name: 'Our House Demo', id: '/?demo' })

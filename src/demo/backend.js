@@ -1,5 +1,5 @@
 // Demo backend: a tiny in-browser stand-in for the Supabase client used by App.jsx.
-// It mirrors the database rules (huis_set, huis_tick, huis_toggle_chore, huis_generate, huis_shame)
+// It mirrors the database rules (huis_set, huis_tick, huis_set_chore, huis_generate, huis_shame)
 // and keeps all state in this visitor's localStorage. No network calls at all.
 import { PEOPLE, HISTORY_FROM, SHAME_FROM, DEMO_ORIGIN_KEY } from '../config.js'
 
@@ -47,7 +47,7 @@ function generate(day) {
   const pairs = (xs) => xs.flatMap((a) => xs.filter((b) => b.name !== a.name).map((b) => [a, b]))
   const v = (d) => diff('2000-01-01', d)
   const mon = monday(day)
-  for (let i = 0; i < 7; i++) {
+  for (let i = 0; i < 8; i++) { // 8 weeks, so 7 stay visible right after the Monday rollover
     const w = add(mon, 7 * i)
     if (diff(anchor, w) % 14 === 0 && !A.some((a) => a.chore_id === 'douche' && a.start_date === w)) {
       const st = PEOPLE.map(stats)
@@ -122,7 +122,8 @@ function shame() {
   const t = today(), ev = {}
   for (const a of S.assignments) {
     if (a.end_date < SHAME_FROM || t <= a.end_date) continue
-    const kind = !a.done_at ? 'missed' : ymd(new Date(a.done_at)) > a.end_date ? 'late' : null
+    // one extra (grace) week to still tick it — counts as late; after that it is missed
+    const kind = !a.done_at ? (t > add(a.end_date, 7) ? 'missed' : 'late') : ymd(new Date(a.done_at)) > a.end_date ? 'late' : null
     if (!kind) continue
     for (const p of a.people) { ev[p] ??= { person: p, missed: 0, late: 0, total: 0 }; ev[p][kind]++; ev[p].total++ }
   }
@@ -140,9 +141,20 @@ const RPC = {
     const u = { updated_at: nowIso() }
     if (d.kind === 'machine') {
       if (!PEOPLE.includes(p_by)) throw new Error('unknown housemate')
-      if (p_action === 'start') Object.assign(u, { state: 'red', set_by: p_by, started_at: nowIso(), ends_at: minutes(p_minutes ?? 60) })
-      else if (p_action === 'done') Object.assign(u, { state: 'orange', set_by: p_by, ends_at: null })
-      else if (p_action === 'empty' || p_action === 'reset') Object.assign(u, { state: 'green', set_by: p_by, started_at: null, ends_at: null })
+      let act = p_action
+      if (act === 'start' && d.state === 'red' && d.set_by === p_by) act = 'adjust'
+      const hhmm = (iso) => new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', minute: '2-digit' }).format(new Date(iso))
+      if (act === 'start') {
+        if (d.state === 'red') throw new Error(`The ${d.label.toLowerCase()} is already running (${d.set_by ? d.set_by + '’s' : 'someone’s'} load, done at ${hhmm(d.ends_at)}) — no need to start it again 🙂`)
+        Object.assign(u, { state: 'red', set_by: p_by, started_at: nowIso(), ends_at: minutes(p_minutes ?? 60) })
+      } else if (act === 'adjust') { // only the time changes; the load keeps its owner
+        if (d.state !== 'red') throw new Error(`The ${d.label.toLowerCase()} isn’t running anymore — nothing to adjust 🙂`)
+        Object.assign(u, { ends_at: minutes(p_minutes ?? 10) })
+      } else if (act === 'done') {
+        if (d.state !== 'red') throw new Error(`The ${d.label.toLowerCase()} isn’t running anymore 🙂`)
+        Object.assign(u, { state: 'orange', ends_at: null })
+      }
+      else if (act === 'empty' || act === 'reset') Object.assign(u, { state: 'green', set_by: p_by, started_at: null, ends_at: null })
       else throw new Error('invalid action')
     } else { // Toilet & Shower are anonymous: never store a name
       if (p_action === 'occupy') Object.assign(u, { state: 'red', set_by: null, started_at: nowIso(), ends_at: null })
@@ -153,12 +165,16 @@ const RPC = {
     Object.assign(d, u)
     return [{ ...d }]
   },
-  huis_toggle_chore: ({ p_id, p_by, p_done }) => {
+  huis_set_chore: ({ p_id, p_by, p_done, p_seq = null }) => {
+    if (typeof p_done !== 'boolean') throw new Error('p_done must be true or false')
     if (!PEOPLE.includes(p_by)) throw new Error('unknown housemate')
     const a = S.assignments.find((x) => x.id === p_id)
     if (!a) throw new Error('unknown chore')
+    if (p_seq != null && a.tick_seq != null && p_seq < a.tick_seq) return [{ ...a }] // an older tap never wins
+    if (!!a.done_at === p_done) { if (p_seq != null) a.tick_seq = p_seq; return [{ ...a }] }
     if (p_done && today() < a.opens_on) throw new Error(`too early — this one opens ${fmtOpens(a.opens_on)}`)
-    Object.assign(a, { done_by: p_done ? p_by : null, done_at: p_done ? nowIso() : null })
+    if (today() > add(a.end_date, 7)) throw new Error(`too late — this one could be ticked until ${fmtOpens(add(a.end_date, 7))}`)
+    Object.assign(a, { done_by: p_done ? p_by : null, done_at: p_done ? nowIso() : null, tick_seq: p_seq ?? a.tick_seq ?? null })
     return [{ ...a }]
   },
 }

@@ -96,3 +96,11 @@ button{font:inherit;color:inherit;cursor:pointer}
 .hist-row.late .hist-st{color:#c2410c}.hist-row.missed .hist-st{color:#b91c1c}
 .demo-banner{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 10px;padding:8px 12px;border-radius:14px;background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;font-size:13px;font-weight:600}
 .demo-banner button{flex:none;border:1px solid #fdba74;background:#fff;color:#9a3412;border-radius:999px;padding:5px 10px;font:inherit;font-size:12px;cursor:pointer}
+/* offline / stale data */
+.lead.stale{color:#9a3412;font-weight:600}
+.card.stale{opacity:.55;filter:grayscale(.85)}
+.card.stale .bulb.on{box-shadow:none}
+/* last week's chores in their grace week */
+.overdue-box{background:#fff7ed;border:1px solid #fed7aa;border-radius:14px;padding:8px 8px 2px;margin-bottom:10px}
+.overdue-box h3{font-size:14px;margin:2px 4px 6px;color:#9a3412}
+.chore.saving .check{opacity:.6}

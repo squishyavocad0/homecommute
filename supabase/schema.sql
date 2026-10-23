@@ -57,6 +57,7 @@ create table if not exists public.huis_chore_assignments (
   done_by text,
   done_at timestamp with time zone,
   opens_on date not null,
+  tick_seq bigint,                         -- last applied tap (client time in ms), guards against out-of-order writes
   constraint huis_chore_assignments_chore_id_start_date_key UNIQUE (chore_id, start_date),
   constraint huis_chore_assignments_pkey PRIMARY KEY (id),
   constraint huis_chore_assignments_chore_id_fkey FOREIGN KEY (chore_id) REFERENCES public.huis_chores(id),
@@ -78,6 +79,13 @@ CREATE OR REPLACE FUNCTION public.huis_deadline(p_end date)
  LANGUAGE sql
  IMMUTABLE
 AS $function$ select ((p_end + 1)::timestamp at time zone 'Europe/Amsterdam') $function$;
+
+-- end of the grace week: a chore can still be ticked (counts as late) until the next Sunday 23:59
+CREATE OR REPLACE FUNCTION public.huis_grace_end(p_end date)
+ RETURNS timestamp with time zone
+ LANGUAGE sql
+ IMMUTABLE
+AS $function$ select ((p_end + 8)::timestamp at time zone 'Europe/Amsterdam') $function$;
 
 CREATE OR REPLACE FUNCTION public.huis_opens_on(p_chore text, p_start date, p_end date)
  RETURNS date
@@ -124,7 +132,7 @@ CREATE OR REPLACE FUNCTION public.huis_set(p_device text, p_action text, p_by te
  SECURITY DEFINER
  SET search_path TO 'public'
 AS $function$
-declare d public.huis_devices;
+declare d public.huis_devices; v_action text := p_action;
 begin
   perform public.huis_tick();
   select * into d from public.huis_devices where id = p_device for update;
@@ -132,42 +140,68 @@ begin
   if p_minutes is not null and (p_minutes < 1 or p_minutes > 600) then raise exception 'invalid duration'; end if;
   if d.kind = 'machine' then
     if p_by is null or not exists (select 1 from public.huis_people where name = p_by) then raise exception 'unknown housemate'; end if;
-    if p_action = 'start' then
-      update public.huis_devices set state='red', set_by=p_by, started_at=now(), ends_at=now()+make_interval(mins=>coalesce(p_minutes,60)), updated_at=now() where id=p_device;
-    elsif p_action = 'done' then
-      update public.huis_devices set state='orange', set_by=p_by, ends_at=null, updated_at=now() where id=p_device;
-    elsif p_action in ('empty','reset') then
+    -- older app versions adjusted their own timer with 'start'
+    if v_action = 'start' and d.state = 'red' and d.set_by = p_by then v_action := 'adjust'; end if;
+    if v_action = 'start' then
+      if d.state = 'red' then
+        raise exception 'The % is already running (% load, done at %) — no need to start it again 🙂', lower(d.label),
+          coalesce(d.set_by || '’s', 'someone’s'), to_char(d.ends_at at time zone 'Europe/Amsterdam', 'HH24:MI');
+      end if;
+      update public.huis_devices set state='red', set_by=p_by, started_at=now(), ends_at=now()+make_interval(mins=>coalesce(p_minutes,60)), updated_at=now()
+        where id=p_device;
+    elsif v_action = 'adjust' then
+      -- only the remaining time changes; the owner (set_by) and start time stay
+      if d.state <> 'red' then raise exception 'The % isn’t running anymore — nothing to adjust 🙂', lower(d.label); end if;
+      update public.huis_devices set ends_at=now()+make_interval(mins=>coalesce(p_minutes,10)), updated_at=now() where id=p_device;
+    elsif v_action = 'done' then
+      -- the load still belongs to whoever started it
+      if d.state <> 'red' then raise exception 'The % isn’t running anymore 🙂', lower(d.label); end if;
+      update public.huis_devices set state='orange', ends_at=null, updated_at=now() where id=p_device;
+    elsif v_action in ('empty','reset') then
       update public.huis_devices set state='green', set_by=p_by, started_at=null, ends_at=null, updated_at=now() where id=p_device;
     else raise exception 'invalid action'; end if;
   else
     -- Toilet & Shower are anonymous: the name is never stored (p_by is ignored)
-    if p_action = 'occupy' then
+    if v_action = 'occupy' then
       update public.huis_devices set state='red', set_by=null, started_at=now(), ends_at=null, updated_at=now() where id=p_device;
-    elsif p_action = 'wait' then
+    elsif v_action = 'wait' then
       update public.huis_devices set state='orange', set_by=null, ends_at=now()+make_interval(mins=>coalesce(p_minutes,10)), updated_at=now() where id=p_device;
-    elsif p_action in ('free','reset') then
+    elsif v_action in ('free','reset') then
       update public.huis_devices set state='green', set_by=null, started_at=null, ends_at=null, updated_at=now() where id=p_device;
     else raise exception 'invalid action'; end if;
   end if;
   return query select * from public.huis_devices where id=p_device;
 end $function$;
 
-CREATE OR REPLACE FUNCTION public.huis_toggle_chore(p_id bigint, p_by text, p_done boolean)
+-- Tick / untick a chore with the wanted state (not a toggle). p_seq: the client's tap time in ms; an older tap
+-- never overwrites a newer one. Ticking opens on opens_on and stays possible until a week after the deadline
+-- (huis_grace_end); after that the row is frozen.
+CREATE OR REPLACE FUNCTION public.huis_set_chore(p_id bigint, p_by text, p_done jsonb, p_seq bigint DEFAULT NULL::bigint)
  RETURNS SETOF huis_chore_assignments
  LANGUAGE plpgsql
  SECURITY DEFINER
  SET search_path TO 'public'
 AS $function$
-declare v_open date; v_today date := (now() at time zone 'Europe/Amsterdam')::date;
+declare a public.huis_chore_assignments; v_done boolean; v_today date := (now() at time zone 'Europe/Amsterdam')::date;
 begin
+  if p_done is null or jsonb_typeof(p_done) <> 'boolean' then raise exception 'p_done must be true or false'; end if;
+  v_done := (p_done #>> '{}')::boolean;
   if p_by is null or not exists (select 1 from public.huis_people where name = p_by) then raise exception 'unknown housemate'; end if;
-  select opens_on into v_open from public.huis_chore_assignments where id = p_id;
+  select * into a from public.huis_chore_assignments where id = p_id for update;
   if not found then raise exception 'unknown chore'; end if;
-  if p_done and v_today < v_open then
-    raise exception 'too early — this one opens %', to_char(v_open, 'Dy FMDD Mon');
+  -- an older tap (lower sequence) never overwrites a newer one
+  if p_seq is not null and a.tick_seq is not null and p_seq < a.tick_seq then return next a; return; end if;
+  -- idempotent: already in the wanted state
+  if (a.done_at is not null) = v_done then
+    if p_seq is not null then update public.huis_chore_assignments set tick_seq = p_seq where id = p_id returning * into a; end if;
+    return next a; return;
   end if;
-  update public.huis_chore_assignments set done_by = case when p_done then p_by else null end, done_at = case when p_done then now() else null end where id = p_id;
-  return query select * from public.huis_chore_assignments where id = p_id;
+  if v_done and v_today < a.opens_on then raise exception 'too early — this one opens %', to_char(a.opens_on, 'Dy FMDD Mon'); end if;
+  if now() >= public.huis_grace_end(a.end_date) then raise exception 'too late — this one could be ticked until %', to_char(a.end_date + 7, 'Dy FMDD Mon'); end if;
+  update public.huis_chore_assignments
+    set done_by = case when v_done then p_by end, done_at = case when v_done then now() end, tick_seq = coalesce(p_seq, tick_seq)
+    where id = p_id returning * into a;
+  return next a;
 end $function$;
 
 CREATE OR REPLACE FUNCTION public.huis_shame_at(p_now timestamp with time zone)
@@ -178,7 +212,9 @@ CREATE OR REPLACE FUNCTION public.huis_shame_at(p_now timestamp with time zone)
 AS $function$
   with ev as (
     select p as person,
-      case when a.done_at is null then 'missed' when a.done_at >= public.huis_deadline(a.end_date) then 'late' end as kind
+      case when a.done_at is null and p_now >= public.huis_grace_end(a.end_date) then 'missed'
+           when a.done_at is null then 'late'
+           when a.done_at >= public.huis_deadline(a.end_date) then 'late' end as kind
     from public.huis_chore_assignments a cross join lateral unnest(a.people) p
     where a.end_date >= date '2026-10-25' and p_now >= public.huis_deadline(a.end_date)
   )
@@ -201,7 +237,7 @@ declare
   w date; v_n int := 0; v_a text; v_b text;
 begin
   perform pg_advisory_xact_lock(hashtext('huis_generate'));
-  for i in 0..6 loop
+  for i in 0..7 loop  -- 8 weeks: 7 stay visible right after the Monday rollover
     w := v_mon + 7 * i;
     -- 1) 2-week block (Shower + Laundry room) starting this week: least Shower/Laundry count, then fewest total cleans, then least recently
     if (w - c_anchor) % 14 = 0 and not exists (select 1 from huis_chore_assignments where chore_id = 'douche' and start_date = w) then
@@ -298,8 +334,10 @@ grant execute on function public.huis_set(text,text,text,integer) to anon, authe
 revoke all on function public.huis_shame_at(timestamp with time zone) from public, anon, authenticated;
 grant execute on function public.huis_shame_at(timestamp with time zone) to public, anon, authenticated;
 revoke all on function public.huis_tick() from public, anon, authenticated;
-revoke all on function public.huis_toggle_chore(bigint,text,boolean) from public, anon, authenticated;
-grant execute on function public.huis_toggle_chore(bigint,text,boolean) to anon, authenticated;
+revoke all on function public.huis_set_chore(bigint,text,jsonb,bigint) from public, anon, authenticated;
+grant execute on function public.huis_set_chore(bigint,text,jsonb,bigint) to anon, authenticated;
+revoke all on function public.huis_grace_end(date) from public, anon, authenticated;
+grant execute on function public.huis_grace_end(date) to public, anon, authenticated;
 
 -- ---------------------------------------------------------------- realtime
 
