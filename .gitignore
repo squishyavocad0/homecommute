@@ -1,0 +1,8 @@
+node_modules
+dist
+.vercel
+.DS_Store
+# local secrets / per-deploy config — never commit
+.env
+.env.*
+!.env.example
